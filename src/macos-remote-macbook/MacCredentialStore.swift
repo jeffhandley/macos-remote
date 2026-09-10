@@ -81,11 +81,12 @@ final class MacCredentialStore {
     private func timingSafeEqual(_ lhs: String, _ rhs: String) -> Bool {
         let left = [UInt8](lhs.utf8)
         let right = [UInt8](rhs.utf8)
-        guard left.count == right.count else {
-            return false
+        var difference = UInt64(left.count ^ right.count)
+        for index in 0 ..< max(left.count, right.count) {
+            let leftByte = index < left.count ? left[index] : 0
+            let rightByte = index < right.count ? right[index] : 0
+            difference |= UInt64(leftByte ^ rightByte)
         }
-        return zip(left, right).reduce(UInt8(0)) { difference, pair in
-            difference | (pair.0 ^ pair.1)
-        } == 0
+        return difference == 0
     }
 }

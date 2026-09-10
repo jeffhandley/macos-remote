@@ -132,7 +132,7 @@ Pro-style keyboard, including Escape and F1 through F12 on the top row. The
 bottom row contains:
 
 `fn`, `control`, `option`, `command`, `space`, `command`, `option`, left arrow,
-down arrow, and right arrow.
+up arrow, down arrow, and right arrow.
 
 Modifier keys cycle independently through three states:
 

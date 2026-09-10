@@ -82,6 +82,7 @@ struct MacBookKeyboardView: View {
             .modifier("⌘", .command, units: 1.25),
             .modifier("option", .option, units: 1.25),
             .key("◀", .leftArrow),
+            .key("▲", .upArrow),
             .key("▼", .downArrow),
             .key("▶", .rightArrow),
         ],

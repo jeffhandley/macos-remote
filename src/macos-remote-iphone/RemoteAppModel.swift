@@ -147,6 +147,10 @@ final class RemoteAppModel: ObservableObject {
 
     private func sendHello(to peripheralID: UUID) {
         currentPeripheralID = peripheralID
+        scheduleConnectionTimeout(
+            after: 15,
+            message: "The Mac did not start pairing. Try connecting again."
+        )
         bluetooth.send(.hello(ClientHello(
             deviceID: store.clientID,
             displayName: UIDevice.current.name,

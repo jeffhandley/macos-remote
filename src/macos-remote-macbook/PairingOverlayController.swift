@@ -3,17 +3,20 @@ import SwiftUI
 
 @MainActor
 final class PairingOverlayController {
-    @Published var rememberDevice = true
-
     private var windows: [NSPanel] = []
     private var code = ""
     private var onCancel: (() -> Void)?
+    private let state = PairingOverlayState()
+
+    var rememberDevice: Bool {
+        state.rememberDevice
+    }
 
     func present(code: String, onCancel: @escaping () -> Void) {
         dismiss()
         self.code = code
         self.onCancel = onCancel
-        rememberDevice = true
+        state.rememberDevice = true
 
         windows = NSScreen.screens.map { screen in
             let panel = PairingPanel(
@@ -31,10 +34,7 @@ final class PairingOverlayController {
             panel.contentView = NSHostingView(
                 rootView: PairingCodeView(
                     code: code,
-                    rememberDevice: Binding(
-                        get: { [weak self] in self?.rememberDevice ?? false },
-                        set: { [weak self] in self?.rememberDevice = $0 }
-                    ),
+                    state: state,
                     cancel: { [weak self] in self?.onCancel?() }
                 )
             )
@@ -43,6 +43,10 @@ final class PairingOverlayController {
         }
         NSApp.activate(ignoringOtherApps: true)
         windows.first?.makeKey()
+    }
+
+    private final class PairingOverlayState: ObservableObject {
+        @Published var rememberDevice = true
     }
 
     func dismiss() {
@@ -59,7 +63,7 @@ private final class PairingPanel: NSPanel {
 
 private struct PairingCodeView: View {
     let code: String
-    @Binding var rememberDevice: Bool
+    @ObservedObject var state: PairingOverlayState
     let cancel: () -> Void
 
     var body: some View {
@@ -89,7 +93,7 @@ private struct PairingCodeView: View {
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Pairing code \(code)")
 
-                Toggle("Remember Device", isOn: $rememberDevice)
+                Toggle("Remember Device", isOn: $state.rememberDevice)
                     .toggleStyle(.checkbox)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(.white)

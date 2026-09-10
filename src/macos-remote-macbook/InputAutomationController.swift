@@ -139,7 +139,7 @@ final class InputAutomationController {
         case .endDrag:
             cancelInteractions()
         case let .magnify(scale):
-            guard abs(scale - 1) > 0.02 else {
+            guard scale.isFinite, abs(scale - 1) > 0.02 else {
                 return
             }
             post(KeyStroke(
@@ -158,10 +158,13 @@ final class InputAutomationController {
     }
 
     private func moveMouse(deltaX: Double, deltaY: Double, dragging: Bool) {
+        guard deltaX.isFinite, deltaY.isFinite else {
+            return
+        }
         let current = CGEvent(source: nil)?.location ?? .zero
         let destination = CGPoint(
-            x: current.x + deltaX,
-            y: current.y + deltaY
+            x: current.x + min(max(deltaX, -1_000), 1_000),
+            y: current.y + min(max(deltaY, -1_000), 1_000)
         )
         let event = CGEvent(
             mouseEventSource: CGEventSource(stateID: .hidSystemState),
@@ -186,7 +189,7 @@ final class InputAutomationController {
         )
         event?.setIntegerValueField(
             .mouseEventClickState,
-            value: Int64(max(1, clickCount))
+            value: Int64(min(max(1, clickCount), 3))
         )
         event?.post(tap: .cghidEventTap)
     }

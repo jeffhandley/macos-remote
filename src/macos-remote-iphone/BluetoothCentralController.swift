@@ -37,6 +37,7 @@ final class BluetoothCentralController: NSObject, ObservableObject {
     private var pendingWrites: [Data] = []
     private var readyNotified = false
     private var disconnectRequested = false
+    private var pendingDisconnectError: Error?
 
     override init() {
         super.init()
@@ -101,7 +102,7 @@ final class BluetoothCentralController: NSObject, ObservableObject {
             pendingWrites.append(contentsOf: frames)
             flushWrites()
         } catch {
-            finishDisconnect(error: error)
+            failConnection(error)
         }
     }
 
@@ -152,8 +153,28 @@ final class BluetoothCentralController: NSObject, ObservableObject {
         connectedPeripheral = nil
         let requested = disconnectRequested
         disconnectRequested = false
-        onDisconnect?(requested ? nil : error)
+        let reportedError = pendingDisconnectError ?? error
+        pendingDisconnectError = nil
+        onDisconnect?(requested ? nil : reportedError)
         startScanning()
+    }
+
+    private func failConnection(_ error: Error) {
+        pendingDisconnectError = error
+        disconnectRequested = false
+        if let connectedPeripheral {
+            manager.cancelPeripheralConnection(connectedPeripheral)
+        } else {
+            finishDisconnect(error: error)
+        }
+    }
+
+    private func connectionError(_ message: String) -> NSError {
+        NSError(
+            domain: "MacOSRemote.Bluetooth",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
     }
 
     private func refreshNearbyMacs() {
@@ -219,6 +240,10 @@ extension BluetoothCentralController: CBCentralManagerDelegate {
             discoveredRSSI.removeAll()
             lastSeen.removeAll()
             refreshNearbyMacs()
+            if let connectedPeripheral {
+                central.cancelPeripheralConnection(connectedPeripheral)
+                finishDisconnect(error: connectionError("Bluetooth became unavailable."))
+            }
         }
     }
 
@@ -246,6 +271,9 @@ extension BluetoothCentralController: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard connectedPeripheral?.identifier == peripheral.identifier else {
+            return
+        }
         finishDisconnect(error: error)
     }
 
@@ -254,18 +282,24 @@ extension BluetoothCentralController: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard connectedPeripheral?.identifier == peripheral.identifier else {
+            return
+        }
         finishDisconnect(error: error)
     }
 }
 
 extension BluetoothCentralController: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard error == nil,
-              let service = peripheral.services?.first(where: {
+        guard error == nil else {
+            failConnection(error!)
+            return
+        }
+        guard let service = peripheral.services?.first(where: {
                   $0.uuid == CBUUID(string: BluetoothIdentifiers.service)
               })
         else {
-            disconnect()
+            failConnection(connectionError("The Mac does not offer the remote-control service."))
             return
         }
         peripheral.discoverCharacteristics(
@@ -283,7 +317,7 @@ extension BluetoothCentralController: CBPeripheralDelegate {
         error: Error?
     ) {
         guard error == nil else {
-            disconnect()
+            failConnection(error!)
             return
         }
         for characteristic in service.characteristics ?? [] {
@@ -297,6 +331,10 @@ extension BluetoothCentralController: CBPeripheralDelegate {
                 break
             }
         }
+        guard commandCharacteristic != nil, responseCharacteristic != nil else {
+            failConnection(connectionError("The Mac has an incomplete remote-control service."))
+            return
+        }
         finishDiscoveryIfReady()
     }
 
@@ -305,8 +343,12 @@ extension BluetoothCentralController: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        guard error == nil, characteristic.isNotifying else {
-            disconnect()
+        guard error == nil else {
+            failConnection(error!)
+            return
+        }
+        guard characteristic.isNotifying else {
+            failConnection(connectionError("The Mac could not enable remote responses."))
             return
         }
         finishDiscoveryIfReady()

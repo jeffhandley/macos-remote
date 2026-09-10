@@ -151,19 +151,19 @@ extension BluetoothPeripheralController: CBPeripheralManagerDelegate {
         guard let firstRequest = requests.first else {
             return
         }
-        var result = CBATTError.Code.success
-        for request in requests {
-            guard request.characteristic.uuid
-                == CBUUID(string: BluetoothIdentifiers.command),
-                request.offset == 0,
-                let value = request.value
-            else {
-                result = .requestNotSupported
-                continue
-            }
-            accept(value, from: request.central)
+        guard requests.allSatisfy({ request in
+            request.characteristic.uuid
+                == CBUUID(string: BluetoothIdentifiers.command)
+                && request.offset == 0
+                && request.value != nil
+        }) else {
+            peripheral.respond(to: firstRequest, withResult: .requestNotSupported)
+            return
         }
-        peripheral.respond(to: firstRequest, withResult: result)
+        for request in requests {
+            accept(request.value!, from: request.central)
+        }
+        peripheral.respond(to: firstRequest, withResult: .success)
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {

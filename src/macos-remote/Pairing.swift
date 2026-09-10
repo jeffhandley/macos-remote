@@ -4,7 +4,10 @@ public struct PairingCode: Codable, Equatable, Sendable, CustomStringConvertible
     public let value: String
 
     public init?(_ value: String) {
-        guard value.count == 4, value.allSatisfy(\.isNumber) else {
+        let bytes = [UInt8](value.utf8)
+        guard bytes.count == 4,
+              bytes.allSatisfy({ (48 ... 57).contains($0) })
+        else {
             return nil
         }
         self.value = value

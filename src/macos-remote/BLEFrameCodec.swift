@@ -8,10 +8,11 @@ public enum BLEFrameError: Error, Equatable {
     case tooManyFrames
     case duplicateFrame
     case assembledMessageTooLarge
+    case tooManyAssemblies
 }
 
 public enum BLEFrameCodec {
-    public static let headerSize = 23
+    public static let headerSize = 15
     public static let version: UInt8 = 1
     private static let magic: [UInt8] = [0x4d, 0x52]
 
@@ -36,11 +37,13 @@ public enum BLEFrameCodec {
             var frame = Data(magic)
             frame.append(version)
             var uuid = messageID.uuid
-            withUnsafeBytes(of: &uuid) { frame.append(contentsOf: $0) }
+            withUnsafeBytes(of: &uuid) { frame.append(contentsOf: $0.prefix(8)) }
             frame.appendUInt16(UInt16(index))
             frame.appendUInt16(UInt16(frameCount))
             if start < end {
-                frame.append(payload[start ..< end])
+                let payloadStart = payload.index(payload.startIndex, offsetBy: start)
+                let payloadEnd = payload.index(payload.startIndex, offsetBy: end)
+                frame.append(payload[payloadStart ..< payloadEnd])
             }
             return frame
         }
@@ -58,19 +61,18 @@ public enum BLEFrameCodec {
             throw BLEFrameError.unsupportedVersion
         }
 
-        let uuid = UUID(uuid: (
+        let messageID = UUID(uuid: (
             bytes[3], bytes[4], bytes[5], bytes[6],
             bytes[7], bytes[8], bytes[9], bytes[10],
-            bytes[11], bytes[12], bytes[13], bytes[14],
-            bytes[15], bytes[16], bytes[17], bytes[18]
+            0, 0, 0, 0, 0, 0, 0, 0
         ))
-        let index = Int(UInt16(bytes[19]) << 8 | UInt16(bytes[20]))
-        let count = Int(UInt16(bytes[21]) << 8 | UInt16(bytes[22]))
+        let index = Int(UInt16(bytes[11]) << 8 | UInt16(bytes[12]))
+        let count = Int(UInt16(bytes[13]) << 8 | UInt16(bytes[14]))
         guard count > 0, index < count else {
             throw BLEFrameError.invalidIndex
         }
         return DecodedFrame(
-            messageID: uuid,
+            messageID: messageID,
             index: index,
             count: count,
             payload: Data(frame.dropFirst(headerSize))
@@ -88,15 +90,24 @@ public struct BLEFrameAssembler: Sendable {
     private var assemblies: [UUID: Assembly] = [:]
     private let timeout: TimeInterval
     private let maximumMessageSize: Int
+    private let maximumAssemblies: Int
 
-    public init(timeout: TimeInterval = 10, maximumMessageSize: Int = WireCodec.maximumMessageSize) {
+    public init(
+        timeout: TimeInterval = 10,
+        maximumMessageSize: Int = WireCodec.maximumMessageSize,
+        maximumAssemblies: Int = 8
+    ) {
         self.timeout = timeout
         self.maximumMessageSize = maximumMessageSize
+        self.maximumAssemblies = maximumAssemblies
     }
 
     public mutating func accept(_ frame: Data, now: Date = Date()) throws -> Data? {
         assemblies = assemblies.filter { now.timeIntervalSince($0.value.createdAt) <= timeout }
         let decoded = try BLEFrameCodec.decode(frame)
+        guard assemblies[decoded.messageID] != nil || assemblies.count < maximumAssemblies else {
+            throw BLEFrameError.tooManyAssemblies
+        }
 
         var assembly = assemblies[decoded.messageID]
             ?? Assembly(count: decoded.count, createdAt: now, chunks: [:])

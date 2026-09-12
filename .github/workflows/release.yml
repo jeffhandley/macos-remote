@@ -1,0 +1,370 @@
+name: Release installers
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  XCODEGEN_VERSION: 2.46.0
+  XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+
+jobs:
+  test:
+    name: Test shared package
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Run tests
+        run: swift test
+
+  macos-installer:
+    name: Build macOS installer
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: release
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Read release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install XcodeGen
+        run: |
+          archive="$RUNNER_TEMP/xcodegen.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          echo "${XCODEGEN_SHA256}  ${archive}" | shasum -a 256 --check
+          unzip -q "$archive" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate --spec project.yml
+
+      - name: Install macOS signing identities
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          : "${CERTIFICATE_BASE64:?Configure MACOS_CERTIFICATE_P12_BASE64 in the release environment}"
+          : "${CERTIFICATE_PASSWORD:?Configure MACOS_CERTIFICATE_PASSWORD in the release environment}"
+
+          certificate_path="$RUNNER_TEMP/macos-release.p12"
+          keychain_path="$RUNNER_TEMP/macos-release.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+      - name: Archive macOS app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_APPLICATION_SIGNING_IDENTITY }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          : "${APPLE_TEAM_ID:?Configure APPLE_TEAM_ID in the release environment}"
+          : "${SIGNING_IDENTITY:?Configure MACOS_APPLICATION_SIGNING_IDENTITY in the release environment}"
+
+          xcodebuild archive \
+            -project macos-remote.xcodeproj \
+            -scheme macos-remote-macbook \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/macos-remote-macbook.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+            ENABLE_HARDENED_RUNTIME=YES \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS='arm64 x86_64' \
+            OTHER_CODE_SIGN_FLAGS=--timestamp \
+            MARKETING_VERSION="$RELEASE_VERSION" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER"
+
+          codesign --verify --deep --strict --verbose=2 \
+            "$RUNNER_TEMP/macos-remote-macbook.xcarchive/Products/Applications/macOS Remote.app"
+
+      - name: Package and notarize macOS installer
+        env:
+          INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          API_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          : "${INSTALLER_IDENTITY:?Configure MACOS_INSTALLER_SIGNING_IDENTITY in the release environment}"
+          : "${API_KEY_ID:?Configure APP_STORE_CONNECT_API_KEY_ID in the release environment}"
+          : "${API_ISSUER_ID:?Configure APP_STORE_CONNECT_ISSUER_ID in the release environment}"
+          : "${API_PRIVATE_KEY_BASE64:?Configure APP_STORE_CONNECT_PRIVATE_KEY_BASE64 in the release environment}"
+
+          app_path="$RUNNER_TEMP/macos-remote-macbook.xcarchive/Products/Applications/macOS Remote.app"
+          output_directory="$RUNNER_TEMP/artifacts"
+          package_path="$output_directory/macos-remote-macOS-${RELEASE_VERSION}.pkg"
+          api_key_path="$RUNNER_TEMP/AuthKey_${API_KEY_ID}.p8"
+          mkdir -p "$output_directory"
+          printf '%s' "$API_PRIVATE_KEY_BASE64" | base64 --decode > "$api_key_path"
+          chmod 600 "$api_key_path"
+
+          productbuild \
+            --component "$app_path" /Applications \
+            --sign "$INSTALLER_IDENTITY" \
+            --keychain "$RUNNER_TEMP/macos-release.keychain-db" \
+            --timestamp \
+            "$package_path"
+          pkgutil --check-signature "$package_path"
+          notarization_result=$(xcrun notarytool submit "$package_path" \
+            --key "$api_key_path" \
+            --key-id "$API_KEY_ID" \
+            --issuer "$API_ISSUER_ID" \
+            --wait \
+            --timeout 30m \
+            --output-format json)
+          printf '%s\n' "$notarization_result"
+          if [[ "$(jq -r '.status' <<<"$notarization_result")" != "Accepted" ]]; then
+            echo "::error::Apple did not accept the macOS installer for notarization."
+            exit 1
+          fi
+          xcrun stapler staple "$package_path"
+          xcrun stapler validate "$package_path"
+          spctl --assess --type install --verbose=2 "$package_path"
+
+      - name: Upload macOS installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-remote-macOS-${{ steps.version.outputs.version }}
+          path: ${{ runner.temp }}/artifacts/macos-remote-macOS-${{ steps.version.outputs.version }}.pkg
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Remove macOS signing material
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/macos-release.keychain-db" 2>/dev/null || true
+          rm -f \
+            "$RUNNER_TEMP/macos-release.p12" \
+            "$RUNNER_TEMP"/AuthKey_*.p8
+
+  iphone-installer:
+    name: Build iPhone installer
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: release
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Read release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install XcodeGen
+        run: |
+          archive="$RUNNER_TEMP/xcodegen.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$archive" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          echo "${XCODEGEN_SHA256}  ${archive}" | shasum -a 256 --check
+          unzip -q "$archive" -d "$RUNNER_TEMP"
+          "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate --spec project.yml
+
+      - name: Install iOS signing identity and profile
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CERTIFICATE_BASE64: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_ADHOC_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          : "${APPLE_TEAM_ID:?Configure APPLE_TEAM_ID in the release environment}"
+          : "${CERTIFICATE_BASE64:?Configure IOS_DISTRIBUTION_CERTIFICATE_P12_BASE64 in the release environment}"
+          : "${CERTIFICATE_PASSWORD:?Configure IOS_DISTRIBUTION_CERTIFICATE_PASSWORD in the release environment}"
+          : "${PROFILE_BASE64:?Configure IOS_ADHOC_PROVISIONING_PROFILE_BASE64 in the release environment}"
+
+          certificate_path="$RUNNER_TEMP/ios-distribution.p12"
+          profile_path="$RUNNER_TEMP/ios-ad-hoc.mobileprovision"
+          profile_plist="$RUNNER_TEMP/ios-ad-hoc.plist"
+          keychain_path="$RUNNER_TEMP/ios-release.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          printf '%s' "$PROFILE_BASE64" | base64 --decode > "$profile_path"
+          security cms -D -i "$profile_path" > "$profile_plist"
+
+          profile_uuid=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$profile_plist")
+          profile_name=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$profile_plist")
+          profile_team=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist")
+          profile_app_id=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist")
+          /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices:0' "$profile_plist" >/dev/null
+
+          if [[ "$profile_team" != "$APPLE_TEAM_ID" ]]; then
+            echo "::error::The iOS provisioning profile belongs to a different Apple team."
+            exit 1
+          fi
+          if [[ "${profile_app_id#*.}" != "com.jeffhandley.macos-remote.iphone" ]]; then
+            echo "::error::The iOS provisioning profile does not match com.jeffhandley.macos-remote.iphone."
+            exit 1
+          fi
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+
+          profiles_directory="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profiles_directory"
+          cp "$profile_path" "$profiles_directory/${profile_uuid}.mobileprovision"
+          echo "IOS_PROFILE_NAME=$profile_name" >> "$GITHUB_ENV"
+          echo "IOS_PROFILE_UUID=$profile_uuid" >> "$GITHUB_ENV"
+
+      - name: Archive iPhone app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_IDENTITY: ${{ secrets.IOS_DISTRIBUTION_SIGNING_IDENTITY }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          : "${SIGNING_IDENTITY:?Configure IOS_DISTRIBUTION_SIGNING_IDENTITY in the release environment}"
+
+          xcodebuild archive \
+            -project macos-remote.xcodeproj \
+            -scheme macos-remote-iphone \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/macos-remote-iphone.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+            PROVISIONING_PROFILE_SPECIFIER="$IOS_PROFILE_NAME" \
+            MARKETING_VERSION="$RELEASE_VERSION" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER"
+
+      - name: Export and verify iPhone installer
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_IDENTITY: ${{ secrets.IOS_DISTRIBUTION_SIGNING_IDENTITY }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          export_options="$RUNNER_TEMP/iOS-ExportOptions.plist"
+          export_directory="$RUNNER_TEMP/ios-export"
+          output_directory="$RUNNER_TEMP/artifacts"
+          mkdir -p "$output_directory"
+
+          python3 - "$export_options" <<'PY'
+          import os
+          import plistlib
+          import sys
+
+          options = {
+              "destination": "export",
+              "manageAppVersionAndBuildNumber": False,
+              "method": "ad-hoc",
+              "provisioningProfiles": {
+                  "com.jeffhandley.macos-remote.iphone": os.environ["IOS_PROFILE_NAME"],
+              },
+              "signingCertificate": os.environ["SIGNING_IDENTITY"],
+              "signingStyle": "manual",
+              "stripSwiftSymbols": True,
+              "teamID": os.environ["APPLE_TEAM_ID"],
+          }
+          with open(sys.argv[1], "wb") as stream:
+              plistlib.dump(options, stream)
+          PY
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/macos-remote-iphone.xcarchive" \
+            -exportOptionsPlist "$export_options" \
+            -exportPath "$export_directory"
+
+          source_ipa=$(find "$export_directory" -maxdepth 1 -name '*.ipa' -print -quit)
+          if [[ -z "$source_ipa" ]]; then
+            echo "::error::xcodebuild did not produce an IPA."
+            exit 1
+          fi
+          output_ipa="$output_directory/macos-remote-iPhone-${RELEASE_VERSION}.ipa"
+          mv "$source_ipa" "$output_ipa"
+
+          verification_directory="$RUNNER_TEMP/ios-verification"
+          unzip -q "$output_ipa" -d "$verification_directory"
+          app_path=$(find "$verification_directory/Payload" -maxdepth 1 -name '*.app' -print -quit)
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+      - name: Upload iPhone installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-remote-iPhone-${{ steps.version.outputs.version }}
+          path: ${{ runner.temp }}/artifacts/macos-remote-iPhone-${{ steps.version.outputs.version }}.ipa
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Remove iOS signing material
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/ios-release.keychain-db" 2>/dev/null || true
+          if [[ -n "${IOS_PROFILE_UUID:-}" ]]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${IOS_PROFILE_UUID}.mobileprovision"
+          fi
+          rm -f \
+            "$RUNNER_TEMP/ios-distribution.p12" \
+            "$RUNNER_TEMP/ios-ad-hoc.mobileprovision" \
+            "$RUNNER_TEMP/ios-ad-hoc.plist"

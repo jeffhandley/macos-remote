@@ -19,7 +19,31 @@ network, an account, or an internet connection. Discovery and pairing happen
 inside the iPhone app's **Nearby Macs** screen rather than in the system
 Bluetooth Settings screen.
 
-## Build and install
+## Install a published release
+
+Publishing a GitHub release triggers the **Release installers** workflow on a
+GitHub-hosted macOS runner. When it succeeds:
+
+1. Open **Actions > Release installers** in this repository.
+2. Open the run whose title matches the published release.
+3. Download and extract both artifacts listed at the bottom of the run.
+4. On the Mac, open `macos-remote-macOS-VERSION.pkg` and complete Installer.
+   The package is Developer ID signed, notarized, and stapled for Gatekeeper.
+5. Connect the iPhone to a Mac and open Apple Configurator.
+6. Select the iPhone and add `macos-remote-iPhone-VERSION.ipa`.
+
+The IPA uses Apple Ad Hoc distribution. Installation works only when the
+iPhone's UDID was registered in the Apple Developer account and included in
+the provisioning profile used for that release. It is not an App Store or
+TestFlight build. To support another iPhone, update the profile and repository
+secret before publishing another release.
+
+GitHub retains these workflow artifacts for 90 days. The repository must be
+configured with Apple Developer signing material before the workflow can run;
+maintainers should follow
+[Apple Developer release configuration](apple-developer-release.md).
+
+## Build and install from source
 
 1. Install Xcode 16 or later and XcodeGen.
 2. From the repository root, run `xcodegen generate`.
